@@ -6,8 +6,8 @@
 ![Python Version](https://img.shields.io/badge/Python-3.10.14%2B-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 [![PRs Welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen)](CONTRIBUTING.md)
-[![Contributors](https://img.shields.io/github/contributors/anka-afk/astrbot_plugin_meme_manager?color=green)](https://github.com/anka-afk/astrbot_plugin_meme_manager/graphs/contributors)
-[![Last Commit](https://img.shields.io/github/last-commit/anka-afk/astrbot_plugin_meme_manager)](https://github.com/anka-afk/astrbot_plugin_meme_manager/commits/main)
+[![Contributors](https://img.shields.io/github/contributors/Sisyphbaous-DT-Project/astrbot_plugin_meme_manager?color=green)](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_meme_manager/graphs/contributors)
+[![Last Commit](https://img.shields.io/github/last-commit/Sisyphbaous-DT-Project/astrbot_plugin_meme_manager)](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_meme_manager/commits/custom)
 
 </div>
 
@@ -21,9 +21,11 @@
 
 - [🌟 AstrBot 表情包管理器](#-astrbot-表情包管理器)
   - [📑 目录](#-目录)
+  - [🍴 关于本 Fork](#-关于本-fork)
   - [📢 通知](#-通知)
   - [❓ 常见问题](#-常见问题)
   - [🚀 功能特点](#-功能特点)
+  - [🔧 Fork 特有功能](#-fork-特有功能)
   - [📦 安装方法](#-安装方法)
   - [🛠️ 第一次使用](#️-第一次使用)
   - [☁️ 图床配置](#️-图床配置)
@@ -31,6 +33,7 @@
   - [📝 使用指令](#-使用指令)
   - [🖥️ WebUI 功能预览](#️-webui-功能预览)
   - [📜 更新日志](#-更新日志)
+    - [v3.20-fork（本 fork 维护版本）](#v320-fork本-fork-维护版本)
     - [v3.20](#v320)
     - [v3.1x](#v31x)
     - [v3.0](#v30)
@@ -44,9 +47,15 @@
 
 一个功能强大的 AstrBot 表情包管理插件，支持 🤖 AI 智能发送表情、🌐 WebUI 管理界面、☁️ 云端同步等特性。
 
+## 🍴 关于本 Fork
+
+这是基于 [anka-afk/astrbot_plugin_meme_manager](https://github.com/anka-afk/astrbot_plugin_meme_manager) v3.20 的个人维护 fork，仓库地址：[https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_meme_manager](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_meme_manager)。
+
+本 fork 重点增强了 **emotion_llm（情绪模型表情判断）** 功能，包括对话上下文注入、标签语义描述等，目前**不计划合并回上游**。
+
 ## 📢 通知
 
-我正在准备**考研**，因此未来的两个月(包括以往的半年)不会维护此插件, 12月以后会重构一下。
+> 本 fork 为个人维护版本，持续迭代中。
 
 ### 比较多的问题:
 关于不访问webui的使用插件并管理表情包的方法: 
@@ -105,6 +114,15 @@
 | 🔒 安全的访问控制机制   | 管理后台仅允许私聊开启，危险命令与危险操作均带确认流程               |
 | 📊 表情发送控制         | 可以控制每次发送的表情数量和频率                                     |
 | 🔄 自动维护 Prompt      | 所有 prompt 会根据修改的表情包文件夹目录自动维护，无需手动添加！     |
+
+## 🔧 Fork 特有功能
+
+| 功能 | 描述 |
+|------|------|
+| 💬 emotion_llm 对话上下文注入 | 情绪模型不再只看单条回复，而是基于完整对话历史判断表情 |
+| 📝 emotion_llm 标签语义说明 | 情绪模型的 system prompt 中，每个标签附带使用场景描述 |
+| 🎰 主模型明确标记跳过情绪模型 | 当主模型已用 `&&tag&&` 或 `[tag]` 明确输出表情时，跳过 emotion_llm 调用 |
+| 🍗 crazyth 标签 | 新增疯狂星期四专属标签 |
 
 ## 📦 安装方法
 
@@ -257,6 +275,13 @@
 
 ## 📜 更新日志
 
+### v3.20-fork（本 fork 维护版本）
+
+- `feat`: 主模型明确输出表情包标记时跳过情感模型判断
+- `feat`: emotion_llm 支持注入对话上下文，提升表情判断准确率
+- `fix`: 调整 emotion_llm 提示词，避免模型过度聚焦最后一条消息
+- `feat`: emotion_llm 支持标签描述注入 + 新增 crazyth 疯狂星期四标签
+
 ### v3.20
 
 - 🗂️ 插件大文件存储切换到 AstrBot 规范的 `data/plugin_data/meme_manager`
@@ -325,7 +350,7 @@
 
 ## 🛠️ 问题反馈
 
-如果遇到问题或有功能建议，欢迎在 GitHub 提交 Issue。
+如果遇到问题或有功能建议，欢迎在本 fork 提交 Issue：[https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_meme_manager/issues](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_meme_manager/issues)
 
 ## 📄 许可证
 
