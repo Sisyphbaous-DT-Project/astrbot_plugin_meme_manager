@@ -153,6 +153,9 @@ class MemeSender(Star):
         )
         self.emotion_llm_enabled = self.config.get("emotion_llm_enabled", False)
         self.emotion_llm_provider_id = self.config.get("emotion_llm_provider_id", "")
+        self.emotion_llm_context_rounds = self.config.get(
+            "emotion_llm_context_rounds", 3
+        )
 
         # 混合消息相关配置
         self.enable_mixed_message = self.config.get("enable_mixed_message", True)
@@ -849,6 +852,84 @@ class MemeSender(Star):
                     f"表情分类 {emotion} 对应的目录 {emotion_path} 包含 {len(memes)} 个图片"
                 )
 
+    async def _build_emotion_context(
+        self, event: AstrMessageEvent, response_text: str
+    ) -> tuple[list[dict], str]:
+        """构建 emotion_llm 的对话上下文。
+
+        从 ConversationManager 获取最近 N 轮历史对话，
+        追加当前轮次，组装为 OpenAI 格式的消息列表。
+
+        Args:
+            event: 当前消息事件
+            response_text: 主模型的原始回复文本（未清理的）
+
+        Returns:
+            (contexts, task_prompt) 元组
+        """
+        rounds = self.emotion_llm_context_rounds
+        valid_tags = sorted(set(self.category_mapping.keys()))
+
+        system_msg = {
+            "role": "system",
+            "content": (
+                "你是表情标签选择器。请根据对话上下文，判断最后一条机器人回复的情绪，"
+                "选择合适的表情标签。\n"
+                f"可用标签: {', '.join(valid_tags)}\n"
+                "只从给定标签中选择，不要编造标签。"
+            ),
+        }
+
+        contexts: list[dict] = [system_msg]
+        user_text = event.get_message_str()
+
+        # 获取历史对话（当前轮次尚未写入，历史中只有 1..N-1 轮）
+        if rounds > 0:
+            umo = event.unified_msg_origin
+            conv_mgr = self.context.conversation_manager
+            try:
+                conv_id = await conv_mgr.get_curr_conversation_id(umo)
+                if conv_id:
+                    conversation = await conv_mgr.get_conversation(umo, conv_id)
+                    if conversation and conversation.history:
+                        history = json.loads(conversation.history)
+                        past = [
+                            msg
+                            for msg in history
+                            if msg.get("role") in ("user", "assistant")
+                        ]
+                        max_past = rounds * 2
+                        if len(past) > max_past:
+                            past = past[-max_past:]
+                        for msg in past:
+                            content = msg.get("content", "")
+                            if isinstance(content, list):
+                                # 多模态内容：提取文本部分
+                                texts = [
+                                    p.get("text", "")
+                                    for p in content
+                                    if isinstance(p, dict) and p.get("type") == "text"
+                                ]
+                                content = " ".join(texts) if texts else "[非文本内容]"
+                            contexts.append(
+                                {"role": msg["role"], "content": str(content)}
+                            )
+            except Exception as e:
+                logger.warning(f"[meme_manager] 获取对话历史失败: {e}")
+
+        # 追加当前轮次（用户消息 + 主模型原始回复）
+        if user_text:
+            contexts.append({"role": "user", "content": user_text})
+        contexts.append({"role": "assistant", "content": response_text})
+
+        task_prompt = (
+            "请基于以上对话上下文，判断最后一条机器人回复需要什么表情，"
+            '返回JSON格式：{"emotions":["tag1","tag2"]}。\n'
+            "只输出JSON，不要解释。"
+        )
+
+        return contexts, task_prompt
+
     @filter.on_llm_response(priority=99999)
     async def resp(self, event: AstrMessageEvent, response: LLMResponse):
         """处理 LLM 响应，识别表情"""
@@ -1031,17 +1112,15 @@ class MemeSender(Star):
                             umo=event.unified_msg_origin
                         )
                     if provider_id:
-                        valid_list = sorted(valid_emoticons)
-                        prompt = (
-                            "你是表情标签选择器，只能从给定标签中选择。\n"
-                            "请基于文本语义判断需要的表情，返回JSON格式："
-                            '{"emotions":["tag1","tag2"]}。\n'
-                            "只输出JSON，不要解释。\n"
-                            f"可用标签: {', '.join(valid_list)}\n"
-                            f"文本: {clean_text}"
+                        # 使用原始 text（未清理的）构建上下文，避免 clean_text
+                        # 被松散匹配破坏后传给 emotion_llm
+                        contexts, task_prompt = await self._build_emotion_context(
+                            event, text
                         )
                         llm_resp = await self.context.llm_generate(
-                            chat_provider_id=provider_id, prompt=prompt
+                            chat_provider_id=provider_id,
+                            prompt=task_prompt,
+                            contexts=contexts,
                         )
                         if llm_resp and llm_resp.completion_text:
                             raw_text = llm_resp.completion_text.strip()

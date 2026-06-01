@@ -109,6 +109,12 @@
     "hint": "留空则使用当前对话的模型",
     "_special": "select_provider"
   },
+  "emotion_llm_context_rounds": {
+    "description": "情感模型获取的对话历史轮数",
+    "type": "int",
+    "default": 3,
+    "hint": "每轮包含一次用户发言和一次机器人回复。设为0则不传上下文，只基于当前回复文本判断。建议1-5轮。"
+  },
   "convert_static_to_gif": {
     "description": "静态图转GIF发送",
     "type": "bool",
