@@ -112,10 +112,11 @@ class CategoryManager:
             local_categories = self.get_local_categories()
             changed = False
 
-            # 为新类别添加默认描述
+            # 为新类别添加默认描述（优先从 DEFAULT_CATEGORY_DESCRIPTIONS 查找）
             for category in local_categories:
                 if category not in self.descriptions:
-                    self.descriptions[category] = "请添加描述"
+                    default_desc = DEFAULT_CATEGORY_DESCRIPTIONS.get(category)
+                    self.descriptions[category] = default_desc or "请添加描述"
                     changed = True
 
             if changed:

@@ -868,13 +868,18 @@ class MemeSender(Star):
             (contexts, task_prompt) 元组
         """
         rounds = self.emotion_llm_context_rounds
-        valid_tags = sorted(set(self.category_mapping.keys()))
+        # 构建带描述的标签列表，供情绪模型理解每个标签的适用场景
+        tag_lines = [
+            f"- {tag}: {desc}"
+            for tag, desc in sorted(self.category_mapping.items())
+        ]
+        tag_desc_text = "\n".join(tag_lines)
 
         system_msg = {
             "role": "system",
             "content": (
                 "你是表情标签助手。请根据对话上下文理解当前情绪氛围，"
-                f"从以下标签中选择最合适的表情标签：{', '.join(valid_tags)}\n"
+                f"从以下标签中选择最合适的表情标签：\n\n{tag_desc_text}\n"
                 "只从给定标签中选择，不要编造标签。"
             ),
         }
