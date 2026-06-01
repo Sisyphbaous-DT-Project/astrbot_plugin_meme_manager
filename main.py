@@ -860,6 +860,7 @@ class MemeSender(Star):
 
         self.found_emotions = []  # 重置表情列表
         valid_emoticons = set(self.category_mapping.keys())  # 预加载合法表情集合
+        has_explicit_meme_markup = False  # 标记主模型是否明确输出了表情包标记
 
         clean_text = text
 
@@ -878,6 +879,7 @@ class MemeSender(Star):
             if emotion in valid_emoticons:
                 temp_replacements.append((original, emotion))
                 strict_emotions.append(emotion)
+                has_explicit_meme_markup = True
             else:
                 temp_replacements.append((original, ""))  # 非法表情静默移除
 
@@ -902,6 +904,7 @@ class MemeSender(Star):
 
                 if emotion in valid_emoticons:
                     bracket_replacements.append((original, emotion))
+                    has_explicit_meme_markup = True
                 elif remove_invalid_markup:
                     invalid_brackets.append(original)
 
@@ -929,6 +932,7 @@ class MemeSender(Star):
                         original, clean_text, match.start()
                     ):
                         paren_replacements.append((original, emotion))
+                        has_explicit_meme_markup = True
                 elif remove_invalid_markup:
                     invalid_parens.append(original)
 
@@ -1015,50 +1019,55 @@ class MemeSender(Star):
         logger.debug(f"[meme_manager] 松散匹配阶段找到的表情: {loose_emotions}")
 
         if self.emotion_llm_enabled:
-            try:
-                provider_id = self.emotion_llm_provider_id
-                if not provider_id:
-                    provider_id = await self.context.get_current_chat_provider_id(
-                        umo=event.unified_msg_origin
-                    )
-                if provider_id:
-                    valid_list = sorted(valid_emoticons)
-                    prompt = (
-                        "你是表情标签选择器，只能从给定标签中选择。\n"
-                        "请基于文本语义判断需要的表情，返回JSON格式："
-                        '{"emotions":["tag1","tag2"]}。\n'
-                        "只输出JSON，不要解释。\n"
-                        f"可用标签: {', '.join(valid_list)}\n"
-                        f"文本: {clean_text}"
-                    )
-                    llm_resp = await self.context.llm_generate(
-                        chat_provider_id=provider_id, prompt=prompt
-                    )
-                    if llm_resp and llm_resp.completion_text:
-                        raw_text = llm_resp.completion_text.strip()
-                        data = None
-                        try:
-                            data = json.loads(raw_text)
-                        except Exception:
-                            match = re.search(r"\{[\s\S]*\}", raw_text)
-                            if match:
-                                try:
-                                    data = json.loads(match.group(0))
-                                except Exception:
-                                    data = None
-                        if isinstance(data, dict):
-                            emotions = data.get("emotions")
-                            if isinstance(emotions, list):
-                                for emo in emotions:
-                                    if isinstance(emo, str) and emo in valid_emoticons:
-                                        self.found_emotions.append(emo)
-                            elif (
-                                isinstance(emotions, str)
-                                and emotions in valid_emoticons
-                            ):
-                                self.found_emotions.append(emotions)
-            except Exception as e:
-                logger.error(f"[meme_manager] 情感模型调用失败: {e}")
+            if has_explicit_meme_markup:
+                logger.info(
+                    "[meme_manager] 主模型已明确输出表情包标记，跳过情感模型判断"
+                )
+            else:
+                try:
+                    provider_id = self.emotion_llm_provider_id
+                    if not provider_id:
+                        provider_id = await self.context.get_current_chat_provider_id(
+                            umo=event.unified_msg_origin
+                        )
+                    if provider_id:
+                        valid_list = sorted(valid_emoticons)
+                        prompt = (
+                            "你是表情标签选择器，只能从给定标签中选择。\n"
+                            "请基于文本语义判断需要的表情，返回JSON格式："
+                            '{"emotions":["tag1","tag2"]}。\n'
+                            "只输出JSON，不要解释。\n"
+                            f"可用标签: {', '.join(valid_list)}\n"
+                            f"文本: {clean_text}"
+                        )
+                        llm_resp = await self.context.llm_generate(
+                            chat_provider_id=provider_id, prompt=prompt
+                        )
+                        if llm_resp and llm_resp.completion_text:
+                            raw_text = llm_resp.completion_text.strip()
+                            data = None
+                            try:
+                                data = json.loads(raw_text)
+                            except Exception:
+                                match = re.search(r"\{[\s\S]*\}", raw_text)
+                                if match:
+                                    try:
+                                        data = json.loads(match.group(0))
+                                    except Exception:
+                                        data = None
+                            if isinstance(data, dict):
+                                emotions = data.get("emotions")
+                                if isinstance(emotions, list):
+                                    for emo in emotions:
+                                        if isinstance(emo, str) and emo in valid_emoticons:
+                                            self.found_emotions.append(emo)
+                                elif (
+                                    isinstance(emotions, str)
+                                    and emotions in valid_emoticons
+                                ):
+                                    self.found_emotions.append(emotions)
+                except Exception as e:
+                    logger.error(f"[meme_manager] 情感模型调用失败: {e}")
 
         # 去重并应用数量限制
         seen = set()
