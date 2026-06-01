@@ -873,9 +873,8 @@ class MemeSender(Star):
         system_msg = {
             "role": "system",
             "content": (
-                "你是表情标签选择器。请根据对话上下文，判断最后一条机器人回复的情绪，"
-                "选择合适的表情标签。\n"
-                f"可用标签: {', '.join(valid_tags)}\n"
+                "你是表情标签助手。请根据对话上下文理解当前情绪氛围，"
+                f"从以下标签中选择最合适的表情标签：{', '.join(valid_tags)}\n"
                 "只从给定标签中选择，不要编造标签。"
             ),
         }
@@ -923,8 +922,7 @@ class MemeSender(Star):
         contexts.append({"role": "assistant", "content": response_text})
 
         task_prompt = (
-            "请基于以上对话上下文，判断最后一条机器人回复需要什么表情，"
-            '返回JSON格式：{"emotions":["tag1","tag2"]}。\n'
+            '当前对话适合用什么表情？返回JSON格式：{"emotions":["tag1","tag2"]}，'
             "只输出JSON，不要解释。"
         )
 
