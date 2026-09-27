@@ -1171,6 +1171,12 @@ class MemeSender(Star):
             f"[meme_manager] 清理后的最终文本内容长度: {len(response.completion_text)}"
         )
 
+        # 兼容 Anthropic 等仅返回纯文本的接口：纯表情回复的正文被清空后，
+        # 核心会因为 result_chain 为空而不再输出消息，导致无法进入装饰阶段补图。
+        # 参照 OpenAI 适配器的结构补一条仅含空 Plain 的消息链，让回复走完正常发送流程。
+        if self.found_emotions and not response.completion_text and not response.result_chain:
+            response.result_chain = MessageChain().message("")
+
         # 标记是否为“纯表情回复”，供后续流程判断
         event.set_extra(
             "meme_manager_empty_meme_reply",
