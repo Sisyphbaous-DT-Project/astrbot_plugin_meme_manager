@@ -1,15 +1,15 @@
 import hashlib
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
-
-from werkzeug.utils import secure_filename
 
 from ..config import MEMES_DIR
 
 logger = logging.getLogger(__name__)
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 单文件上传上限，前端提示文案与此保持一致
 
 
 class DuplicateEmojiError(ValueError):
@@ -20,12 +20,91 @@ class DuplicateEmojiError(ValueError):
         super().__init__(f"同一分类中已存在相同文件：{existing_filename}")
 
 
+class InvalidImageError(ValueError):
+    """Raised when uploaded content is empty or not a decodable image."""
+
+
+class FileTooLargeError(ValueError):
+    """Raised when uploaded content exceeds MAX_UPLOAD_BYTES."""
+
+
+class InvalidCategoryError(ValueError):
+    """Raised when a category name is not a safe single-level directory name."""
+
+
+class InvalidFilenameError(ValueError):
+    """Raised when a filename is empty or contains unsafe parts."""
+
+
+# 分类名/文件名中不允许出现的字符：路径分隔符、URL 语义字符、控制字符等
+_UNSAFE_NAME_CHARS = re.compile(r'[/\\?#%:*<>"|\x00-\x1f\x7f]')
+
+
 def _is_supported_image(filename: str) -> bool:
     return filename.lower().endswith(IMAGE_EXTENSIONS)
 
 
+def validate_category_name(category: str) -> str:
+    """校验分类名是安全的单层目录名，非法输入直接抛 InvalidCategoryError。"""
+    if not isinstance(category, str):
+        raise InvalidCategoryError("分类名必须是字符串")
+    name = category.strip()
+    if not name:
+        raise InvalidCategoryError("分类名不能为空")
+    if name in (".", "..") or name.startswith("."):
+        raise InvalidCategoryError(f"非法分类名：{category!r}")
+    if _UNSAFE_NAME_CHARS.search(name):
+        raise InvalidCategoryError(f"分类名包含不允许的字符：{category!r}")
+    return name
+
+
+def validate_filename(filename: str) -> str:
+    """校验文件名是安全的单层文件名（不含路径成分），非法直接抛 InvalidFilenameError。"""
+    if not isinstance(filename, str):
+        raise InvalidFilenameError("文件名必须是字符串")
+    name = filename.strip()
+    if not name or name in (".", "..") or name.startswith("."):
+        raise InvalidFilenameError(f"非法文件名：{filename!r}")
+    if name != Path(name).name or _UNSAFE_NAME_CHARS.search(name):
+        raise InvalidFilenameError(f"文件名包含不允许的字符：{filename!r}")
+    return name
+
+
+def resolve_in_memes(category: str, filename: str | None = None) -> Path:
+    """拼出分类/文件的真实路径，确认解析后仍在 MEMES_DIR 内（防 .. 与软链接逃逸）。"""
+    safe_category = validate_category_name(category)
+    base = Path(MEMES_DIR).resolve()
+    target = base / safe_category
+    if filename is not None:
+        target = target / validate_filename(filename)
+    resolved = target.resolve()
+    if resolved != base and base not in resolved.parents:
+        raise InvalidCategoryError(f"路径越界：{category!r}")
+    return resolved
+
+
+def sanitize_filename(filename: str) -> str | None:
+    """清理用户上传的文件名：去掉路径成分和控制字符，保留中文主体。
+
+    返回清理后的文件名；如果没有可用的主体部分则返回 None（由上层生成默认名）。
+    扩展名的最终以内容嗅探为准，这里只保留原扩展名作为参考。
+    """
+    if not filename:
+        return None
+    name = Path(filename).name.strip().strip(".")
+    # 去掉控制字符与路径分隔符残留
+    name = re.sub(r'[/\\?#%:*<>"|\x00-\x1f\x7f]', "", name).strip()
+    if not name:
+        return None
+    # 主体为空（如 ".jpg"、"..."）视为无效
+    if not Path(name).stem:
+        return None
+    return name
+
+
 def _get_category_path(category: str) -> Path:
-    return Path(MEMES_DIR) / category
+    """分类目录路径：校验名称并解析真实路径，越界（..、软链接逃逸）直接抛错。"""
+    return resolve_in_memes(category)
 
 
 def _iter_category_image_paths(category_path: Path) -> list[Path]:
@@ -93,120 +172,106 @@ def get_emoji_by_category(category):
     return [path.name for path in _iter_category_image_paths(category_path)]
 
 
-def add_emoji_to_category(category, image_file):
-    """
-    添加表情包到指定类别
+def add_emoji_to_category(
+    category: str, content: bytes, original_filename: str
+) -> dict[str, object]:
+    """添加表情包到指定类别（纯 bytes 接口）。
 
     Args:
         category: 类别名
-        image_file: 上传的文件对象
+        content: 文件内容字节
+        original_filename: 用户上传时的原始文件名
 
     Returns:
-        dict[str, str]: 保存后的文件路径和最终文件名
+        dict: {outcome, category, filename, size, mime_type, width, height, is_animated}
+
+    Raises:
+        InvalidCategoryError: 分类名非法
+        FileTooLargeError: 超过大小上限
+        InvalidImageError: 空内容或无法解析的图片
+        DuplicateEmojiError: 同分类已存在相同内容
     """
-    if not image_file:
-        logger.error("没有接收到文件")
-        raise ValueError("没有接收到文件")
+    from .media import sniff_image  # 延迟导入避免环
 
-    if not image_file.filename:
-        logger.error("文件名为空")
-        raise ValueError("文件名为空")
+    safe_category = validate_category_name(category)
+    if not content:
+        raise InvalidImageError("上传内容为空")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise FileTooLargeError(
+            f"文件超过大小上限（{MAX_UPLOAD_BYTES // 1024 // 1024} MiB）"
+        )
 
-    # 确保类别目录存在
-    category_path = Path(MEMES_DIR) / category
+    info = None
+    try:
+        info = sniff_image(content)
+    except ValueError as exc:
+        raise InvalidImageError(str(exc)) from exc
+
+    category_path = resolve_in_memes(safe_category)
     category_path.mkdir(parents=True, exist_ok=True)
 
-    # 保存文件
-    filename = image_file.filename
-    # 生成安全的文件名
-    safe_filename = secure_filename(filename)
+    # 文件名：保留中文主体，扩展名以内容嗅探为准
+    cleaned = sanitize_filename(original_filename or "")
+    if cleaned is None:
+        cleaned = f"image_{int(__import__('time').time())}"
+    stem = Path(cleaned).stem or "image"
+    filename = f"{stem}{info.extension}"
 
-    # 如果文件名被修改了，记录日志
-    if safe_filename != filename:
-        logger.info(f"文件名已从 {filename} 修改为安全的文件名 {safe_filename}")
-        filename = safe_filename
+    # 内容去重：同分类同内容直接跳过
+    content_hash = _calculate_file_hash(content)
+    duplicate_path = _find_duplicate_image(category_path, content_hash)
+    if duplicate_path is not None:
+        logger.info(
+            "跳过重复文件上传: 类别=%s, 上传名=%s, 已存在文件=%s",
+            safe_category,
+            original_filename,
+            duplicate_path.name,
+        )
+        raise DuplicateEmojiError(duplicate_path.name)
 
-    file_path = category_path / filename
+    file_path = _build_available_file_path(category_path, filename)
 
+    # 先写临时文件，确认完整后原子落盘为正式文件
+    tmp_path = file_path.with_name(f".{file_path.name}.tmp-{os.getpid()}")
     try:
-        # 检查目录是否可写
-        if not os.access(category_path, os.W_OK):
-            logger.error(f"没有权限写入目录: {category_path}")
-            raise OSError(f"没有权限写入目录: {category_path}")
-
-        # 检查磁盘空间是否足够
-        _, _, free = shutil.disk_usage(category_path)
-        # 假设文件不会超过10MB，保险起见检查是否至少有10MB
-        if free < 10 * 1024 * 1024:
-            logger.error(f"磁盘空间不足: 只有 {free / 1024 / 1024:.2f}MB")
-            raise OSError("磁盘空间不足")
-
-        # 直接以二进制方式读取和写入文件，避免FileStorage.save可能存在的问题
-        image_file.stream.seek(0)  # 确保从头开始读取
-        content = image_file.stream.read()
-        if not content:
-            logger.error("文件内容为空")
-            raise OSError("上传文件内容为空")
-
-        content_hash = _calculate_file_hash(content)
-        duplicate_path = _find_duplicate_image(category_path, content_hash)
-        if duplicate_path is not None:
-            logger.info(
-                "跳过重复文件上传: 类别=%s, 上传名=%s, 已存在文件=%s",
-                category,
-                filename,
-                duplicate_path.name,
-            )
-            raise DuplicateEmojiError(duplicate_path.name)
-
-        file_path = _build_available_file_path(category_path, filename)
-
-        # 记录日志，包括绝对路径
-        logger.info(f"准备保存文件到: {file_path.absolute()}")
-
-        # 以二进制写入模式保存文件
-        with open(file_path, "wb") as f:
+        with open(tmp_path, "wb") as f:
             f.write(content)
+        os.replace(tmp_path, file_path)
+    except Exception:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
-        # 验证文件是否成功保存
-        if not file_path.exists():
-            logger.error(f"文件保存失败，{file_path} 不存在")
-            raise OSError(f"文件保存失败，{file_path} 不存在")
+    if not file_path.exists() or file_path.stat().st_size == 0:
+        raise OSError(f"文件保存失败: {file_path}")
 
-        file_size = file_path.stat().st_size
-        if file_size == 0:
-            logger.error(f"文件保存失败，{file_path} 大小为0")
-            raise OSError(f"文件保存失败，{file_path} 大小为0")
-
-        logger.info(f"文件成功保存到 {file_path}, 大小: {file_size} 字节")
-        return {"path": str(file_path), "filename": file_path.name}
-
-    except Exception as e:
-        if isinstance(e, DuplicateEmojiError):
-            raise
-        logger.error(f"保存文件时出错: {str(e)}", exc_info=True)
-        # 如果文件已部分创建，尝试删除
-        if file_path.exists():
-            try:
-                file_path.unlink()  # 删除文件
-                logger.info(f"已删除部分上传的文件: {file_path}")
-            except Exception as del_e:
-                logger.error(f"无法删除部分上传的文件: {del_e}")
-        raise OSError(f"保存文件时出错: {str(e)}")
+    logger.info("文件成功保存到 %s, 大小: %d 字节", file_path, len(content))
+    return {
+        "outcome": "added",
+        "category": safe_category,
+        "filename": file_path.name,
+        "path": str(file_path),
+        "size": len(content),
+        "mime_type": info.mime_type,
+        "width": info.width,
+        "height": info.height,
+        "is_animated": info.is_animated,
+    }
 
 
 def delete_emoji_from_category(category, image_file):
     """删除指定类别下的表情包"""
-    category_path = _get_category_path(category)
-    if not category_path.is_dir():
+    try:
+        image_path = resolve_in_memes(category, image_file)
+    except (InvalidCategoryError, InvalidFilenameError):
         return False
-
-    image_name = Path(image_file).name
-    image_path = category_path / image_name
-    if image_path.is_file() and _is_supported_image(image_path.name):
-        image_path.unlink()
-        return True
-    return False
+    if not image_path.is_file() or not _is_supported_image(image_path.name):
+        return False
+    image_path.unlink()
+    return True
 
 
 def batch_delete_emojis(category: str, image_files: list[str]) -> dict[str, object]:
@@ -237,23 +302,23 @@ def batch_delete_emojis(category: str, image_files: list[str]) -> dict[str, obje
 def move_emoji_to_category(
     source_category: str, image_file: str, target_category: str
 ) -> dict[str, object]:
-    """将单个表情包移动到另一个类别。"""
-    source_category_path = _get_category_path(source_category)
+    """将单个表情包移动到另一个类别。源与目标都做边界校验，非法输入直接抛错。"""
+    source_category_path = resolve_in_memes(source_category)
+    target_category_path = resolve_in_memes(target_category)
+    image_name = validate_filename(image_file)
     if not source_category_path.is_dir():
         return {
             "source_category_exists": False,
             "target_category": target_category,
-            "filename": Path(image_file).name,
+            "filename": image_name,
             "moved": False,
             "conflict": False,
             "missing": True,
         }
 
-    target_category_path = _get_category_path(target_category)
     target_category_path.mkdir(parents=True, exist_ok=True)
 
-    image_name = Path(image_file).name
-    source_image_path = source_category_path / image_name
+    source_image_path = resolve_in_memes(source_category, image_name)
     target_image_path = target_category_path / image_name
 
     if not source_image_path.is_file() or not _is_supported_image(
@@ -294,7 +359,8 @@ def batch_move_emojis(
     source_category: str, image_files: list[str], target_category: str
 ) -> dict[str, object]:
     """批量将表情包移动到另一个类别。"""
-    source_category_path = _get_category_path(source_category)
+    source_category_path = resolve_in_memes(source_category)
+    resolve_in_memes(target_category)  # 目标分类先校验，非法直接抛错
     if not source_category_path.is_dir():
         return {
             "source_category_exists": False,
@@ -329,23 +395,23 @@ def batch_move_emojis(
 def copy_emoji_to_category(
     source_category: str, image_file: str, target_category: str
 ) -> dict[str, object]:
-    """将单个表情包复制到另一个类别。"""
-    source_category_path = _get_category_path(source_category)
+    """将单个表情包复制到另一个类别。源与目标都做边界校验，非法输入直接抛错。"""
+    source_category_path = resolve_in_memes(source_category)
+    target_category_path = resolve_in_memes(target_category)
+    image_name = validate_filename(image_file)
     if not source_category_path.is_dir():
         return {
             "source_category_exists": False,
             "target_category": target_category,
-            "filename": Path(image_file).name,
+            "filename": image_name,
             "copied": False,
             "conflict": False,
             "missing": True,
         }
 
-    target_category_path = _get_category_path(target_category)
     target_category_path.mkdir(parents=True, exist_ok=True)
 
-    image_name = Path(image_file).name
-    source_image_path = source_category_path / image_name
+    source_image_path = resolve_in_memes(source_category, image_name)
     target_image_path = target_category_path / image_name
 
     if not source_image_path.is_file() or not _is_supported_image(
@@ -386,7 +452,8 @@ def batch_copy_emojis(
     source_category: str, image_files: list[str], target_category: str
 ) -> dict[str, object]:
     """批量将表情包复制到另一个类别。"""
-    source_category_path = _get_category_path(source_category)
+    source_category_path = resolve_in_memes(source_category)
+    resolve_in_memes(target_category)
     if not source_category_path.is_dir():
         return {
             "source_category_exists": False,
@@ -419,8 +486,11 @@ def batch_copy_emojis(
 
 
 def clear_category_emojis(category: str) -> dict[str, object]:
-    """清空指定类别下的所有表情包，但保留类别目录和配置。"""
-    category_path = _get_category_path(category)
+    """清空指定类别下的所有表情包，但保留类别目录和配置。
+
+    分类名非法或目录软链接逃逸时抛 InvalidCategoryError，不做任何删除。
+    """
+    category_path = resolve_in_memes(category)
     if not category_path.is_dir():
         return {
             "category_exists": False,
@@ -439,14 +509,26 @@ def clear_category_emojis(category: str) -> dict[str, object]:
 
 
 def clear_all_emojis() -> dict[str, object]:
-    """清空所有类别中的表情包，但保留目录和配置。"""
+    """清空所有类别中的表情包，但保留目录和配置。
+
+    遍历时跳过解析后越界的目录（例如指向图库外的软链接），不做任何删除。
+    """
     deleted_by_category = {}
-    memes_root = Path(MEMES_DIR)
+    memes_root = Path(MEMES_DIR).resolve()
     if not memes_root.exists():
         return {"deleted_by_category": deleted_by_category}
 
     for category_path in memes_root.iterdir():
         if not category_path.is_dir():
+            continue
+        try:
+            resolved = category_path.resolve()
+            if resolved != memes_root and memes_root not in resolved.parents:
+                logger.warning(
+                    "清空全部时跳过越界目录（可能是外部软链接）: %s", category_path
+                )
+                continue
+        except OSError:
             continue
         result = clear_category_emojis(category_path.name)
         deleted_files = result["deleted_files"]
@@ -465,8 +547,10 @@ def update_emoji_in_category(category, old_image_file, new_image_file):
     old_image_path = os.path.join(category_path, old_image_file)
     if os.path.exists(old_image_path):
         os.remove(old_image_path)
-        filename = secure_filename(new_image_file.filename)
-        target_path = os.path.join(category_path, filename)
+        cleaned = sanitize_filename(new_image_file.filename)
+        if cleaned is None:
+            return False
+        target_path = os.path.join(category_path, cleaned)
         new_image_file.save(target_path)
         return True
     return False

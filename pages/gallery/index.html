@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>表情包管理</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <button id="sidebar-toggle" class="icon-btn mobile-only" type="button" aria-label="分类">☰</button>
+      <h1>表情包管理</h1>
+      <input id="search" type="search" placeholder="搜索分类或文件名……" />
+      <button id="add-btn" type="button" class="primary">添加图片</button>
+      <input id="file-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden />
+    </header>
+
+    <div class="layout">
+      <aside id="sidebar" class="sidebar">
+        <div class="sidebar-head">
+          <span>分类列表</span>
+          <button id="new-category-btn" type="button" class="link-btn">+ 新建分类</button>
+        </div>
+        <ul id="category-list" class="category-list"></ul>
+
+        <details id="advanced" class="advanced">
+          <summary>高级操作</summary>
+          <div class="advanced-body">
+            <div id="sync-status" class="sync-status">图床状态未加载（展开高级操作时查询）</div>
+            <div class="sync-actions">
+              <button id="sync-upload" type="button" class="ghost">同步到云端</button>
+              <button id="sync-download" type="button" class="ghost">从云端同步</button>
+              <button id="sync-overwrite-remote" type="button" class="ghost danger">覆盖到云端</button>
+              <button id="sync-overwrite-local" type="button" class="ghost danger">从云端覆盖</button>
+            </div>
+            <button id="clear-all-btn" type="button" class="ghost danger">清空全部图片</button>
+          </div>
+        </details>
+      </aside>
+      <div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
+
+      <main class="main">
+        <div class="main-head">
+          <div>
+            <span id="current-scope" class="scope">全部图片</span>
+            <span id="scope-desc" class="scope-desc"></span>
+          </div>
+          <div class="head-actions">
+            <button id="select-mode-btn" type="button" class="ghost">选择</button>
+            <span id="category-menu-wrap" class="menu-wrap" hidden>
+              <button id="category-edit-btn" type="button" class="ghost">编辑</button>
+              <button id="category-more-btn" type="button" class="ghost">更多</button>
+            </span>
+          </div>
+        </div>
+        <div id="drop-hint" class="drop-hint">可以把图片文件拖到这里，或复制图片后按 Ctrl+V 粘贴</div>
+        <div id="status" class="status">加载中……</div>
+        <div id="grid" class="grid"></div>
+        <div id="pager" class="pager"></div>
+      </main>
+    </div>
+
+    <div id="batch-bar" class="batch-bar" hidden>
+      <span id="batch-count">已选 0 张</span>
+      <button id="batch-select-all" type="button" class="ghost">全选当前已加载</button>
+      <button id="batch-move" type="button" class="ghost">移动</button>
+      <button id="batch-copy" type="button" class="ghost">复制</button>
+      <button id="batch-delete" type="button" class="ghost danger">删除</button>
+      <button id="batch-cancel" type="button" class="ghost">取消选择</button>
+    </div>
+
+    <!-- 待添加预览弹窗 -->
+    <div id="upload-modal" class="modal" hidden>
+      <div class="modal-body upload-body" role="dialog" aria-modal="true" aria-label="添加图片">
+        <div class="modal-head">
+          <span>添加到分类：</span>
+          <select id="upload-category"></select>
+          <span class="spacer"></span>
+          <button id="upload-zoom" type="button" class="ghost">原始尺寸</button>
+          <button id="upload-close" type="button" class="icon-btn" aria-label="关闭">×</button>
+        </div>
+        <div class="upload-main">
+          <div id="upload-preview" class="preview-pane checkerboard">
+            <div class="preview-placeholder">选择左侧项目查看预览</div>
+          </div>
+          <div class="upload-side">
+            <div id="upload-info" class="info"></div>
+            <ul id="upload-list" class="upload-list"></ul>
+            <div class="upload-side-actions">
+              <button id="upload-more" type="button" class="ghost">继续加入</button>
+              <button id="upload-clear" type="button" class="ghost danger">清空整批</button>
+            </div>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <span id="upload-progress" class="muted"></span>
+          <button id="upload-cancel-rest" type="button" class="ghost" hidden>取消剩余</button>
+          <button id="upload-confirm" type="button" class="primary">确认添加</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 图库大图查看器 -->
+    <div id="viewer" class="modal" hidden>
+      <div class="modal-body viewer-body" role="dialog" aria-modal="true" aria-label="查看图片">
+        <div class="modal-head">
+          <span id="viewer-title" class="viewer-title"></span>
+          <span class="spacer"></span>
+          <button id="viewer-zoom" type="button" class="ghost">原始尺寸</button>
+          <button id="viewer-download" type="button" class="ghost">下载</button>
+          <button id="viewer-close" type="button" class="icon-btn" aria-label="关闭">×</button>
+        </div>
+        <div id="viewer-pane" class="preview-pane checkerboard viewer-pane">
+          <div class="preview-placeholder">加载中……</div>
+        </div>
+        <div class="modal-foot">
+          <button id="viewer-prev" type="button" class="ghost">← 上一张</button>
+          <span id="viewer-info" class="info"></span>
+          <button id="viewer-next" type="button" class="ghost">下一张 →</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 通用确认弹窗 -->
+    <div id="confirm-modal" class="modal" hidden>
+      <div class="modal-body confirm-body" role="dialog" aria-modal="true">
+        <div id="confirm-title" class="confirm-title"></div>
+        <div id="confirm-text" class="confirm-text"></div>
+        <div class="modal-foot">
+          <button id="confirm-cancel" type="button" class="ghost">取消</button>
+          <button id="confirm-ok" type="button" class="primary danger-solid">确认</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 分类编辑弹窗 -->
+    <div id="category-modal" class="modal" hidden>
+      <div class="modal-body confirm-body" role="dialog" aria-modal="true">
+        <div id="category-modal-title" class="confirm-title"></div>
+        <label class="field">
+          <span>分类名</span>
+          <input id="category-name-input" type="text" maxlength="50" />
+        </label>
+        <label class="field">
+          <span>用途说明</span>
+          <textarea id="category-desc-input" rows="3"></textarea>
+        </label>
+        <div class="modal-foot">
+          <button id="category-cancel" type="button" class="ghost">取消</button>
+          <button id="category-ok" type="button" class="primary">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 移动/复制目标选择弹窗 -->
+    <div id="target-modal" class="modal" hidden>
+      <div class="modal-body confirm-body" role="dialog" aria-modal="true">
+        <div id="target-title" class="confirm-title"></div>
+        <ul id="target-list" class="target-list"></ul>
+        <div class="modal-foot">
+          <button id="target-cancel" type="button" class="ghost">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast-root" class="toast-root"></div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

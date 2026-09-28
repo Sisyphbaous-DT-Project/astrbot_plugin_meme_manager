@@ -184,6 +184,34 @@ def save_json(data: dict[str, Any], filepath: str) -> bool:
         return False
 
 
+def save_json_atomic(data: dict[str, Any], filepath: str) -> bool:
+    """原子保存 JSON：先写同目录临时文件，再 os.replace 替换，中途失败不损坏原文件。"""
+    import tempfile
+
+    try:
+        ensure_dir_exists(os.path.dirname(filepath))
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(filepath), suffix=".tmp", prefix=".save-"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, filepath)
+            return True
+        except Exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        logger.error(f"原子保存 JSON 文件失败 {filepath}: {e}")
+        return False
+
+
 def load_json(filepath: str, default: dict = None) -> dict:
     """从文件加载 JSON 数据"""
     try:

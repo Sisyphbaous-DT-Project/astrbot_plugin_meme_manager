@@ -228,7 +228,7 @@ class SyncManager:
         if to_upload:
             print(f"\n开始上传 {len(to_upload)} 个文件...")
             uploaded_count = 0
-            skipped_count = 0
+            failed_count = 0
 
             with tqdm(total=len(to_upload), desc="上传进度") as pbar:
                 for image in to_upload:
@@ -251,10 +251,14 @@ class SyncManager:
 
                     except Exception as e:
                         print(f"\n上传失败: {file_path.name} - {str(e)}")
-                        skipped_count += 1
+                        failed_count += 1
                         pbar.update(1)
 
-            print(f"\n上传完成: 成功 {uploaded_count} 个，失败 {skipped_count} 个")
+            print(f"\n上传完成: 成功 {uploaded_count} 个，失败 {failed_count} 个")
+            # 有单项失败就如实返回 False（部分失败 ≠ 整体成功），
+            # 让上层能区分"完全成功"和"部分失败"
+            if failed_count > 0:
+                return False
         else:
             print("\n没有需要上传的文件")
 
@@ -274,6 +278,7 @@ class SyncManager:
             print(f"\n开始下载 {len(to_download)} 个文件...")
             downloaded_count = 0
             skipped_count = 0
+            failed_count = 0
 
             with tqdm(total=len(to_download), desc="下载进度") as pbar:
                 for image in to_download:
@@ -297,16 +302,19 @@ class SyncManager:
                             pbar.update(1)
                         else:
                             print(f"\n下载失败: {filename}")
-                            skipped_count += 1
+                            failed_count += 1
                             pbar.update(1)
                     except Exception as e:
                         print(f"\n下载失败: {filename} - {str(e)}")
-                        skipped_count += 1
+                        failed_count += 1
                         pbar.update(1)
 
             print(
-                f"\n下载完成: 成功 {downloaded_count} 个，失败/跳过 {skipped_count} 个"
+                f"\n下载完成: 成功 {downloaded_count} 个，失败 {failed_count} 个，跳过 {skipped_count} 个"
             )
+            # 有单项失败就如实返回 False（部分失败 ≠ 整体成功）
+            if failed_count > 0:
+                return False
         else:
             print("\n没有需要下载的文件")
 
@@ -316,11 +324,12 @@ class SyncManager:
         """从本地覆盖云端 - 让云端完全和本地一致"""
         status = self.check_sync_status()
 
-        # 1. 上传本地多出的文件
-        self.sync_to_remote()
+        # 1. 上传本地多出的文件（部分失败会反映在返回值里）
+        upload_ok = self.sync_to_remote()
 
         # 2. 删除云端多出的文件
         to_delete_remote = status.get("to_delete_remote", [])
+        delete_failed = 0
         if to_delete_remote:
             print(f"\n开始清理云端多出的 {len(to_delete_remote)} 个文件...")
             deleted_count = 0
@@ -328,23 +337,28 @@ class SyncManager:
                 try:
                     if self.image_host.delete_image(img["id"]):
                         deleted_count += 1
+                    else:
+                        delete_failed += 1
+                        print(f"\n删除云端文件失败: {img['filename']}")
                 except Exception as e:
+                    delete_failed += 1
                     print(f"\n删除云端文件失败: {img['filename']} - {str(e)}")
-            print(f"\n云端清理完成: 成功删除 {deleted_count} 个")
+            print(f"\n云端清理完成: 成功删除 {deleted_count} 个，失败 {delete_failed} 个")
         else:
             print("\n云端没有多出的文件，无需清理")
 
-        return True
+        return upload_ok and delete_failed == 0
 
     def overwrite_from_remote(self) -> bool:
         """从云端覆盖本地 - 让本地完全和云端一致"""
         status = self.check_sync_status()
 
-        # 1. 下载本地缺失的文件
-        self.sync_from_remote()
+        # 1. 下载本地缺失的文件（部分失败会反映在返回值里）
+        download_ok = self.sync_from_remote()
 
         # 2. 删除本地多出的文件
         to_delete_local = status.get("to_delete_local", [])
+        delete_failed = 0
         if to_delete_local:
             print(f"\n开始清理本地多出的 {len(to_delete_local)} 个文件...")
             deleted_count = 0
@@ -360,9 +374,10 @@ class SyncManager:
                                 file_path, img.get("category", "")
                             )
                 except Exception as e:
+                    delete_failed += 1
                     print(f"\n删除本地文件失败: {img['filename']} - {str(e)}")
-            print(f"\n本地清理完成: 成功删除 {deleted_count} 个")
+            print(f"\n本地清理完成: 成功删除 {deleted_count} 个，失败 {delete_failed} 个")
         else:
             print("\n本地没有多出的文件，无需清理")
 
-        return True
+        return download_ok and delete_failed == 0

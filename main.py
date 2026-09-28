@@ -9,7 +9,6 @@ import ssl
 import tempfile
 import time
 import traceback
-from multiprocessing import Process
 
 import aiohttp
 from PIL import Image as PILImage
@@ -22,12 +21,8 @@ from astrbot.api.message_components import *  # noqa: F403
 from astrbot.api.message_components import Image
 from astrbot.api.provider import LLMResponse
 from astrbot.api.star import Context, Star, register
-from astrbot.core import astrbot_config
 from astrbot.core.message.components import Plain
 from astrbot.core.message.message_event_result import MessageChain, ResultContentType
-from astrbot.core.platform import MessageType as PlatformMessageType
-from astrbot.core.platform.message_session import MessageSession
-from astrbot.core.utils.io import get_local_ip_addresses
 from astrbot.core.utils.session_waiter import (
     SessionController,
     SessionFilter,
@@ -35,7 +30,10 @@ from astrbot.core.utils.session_waiter import (
 )
 
 from .backend.category_manager import CategoryManager
+from .backend.dashboard_api import overwrite_sync_running, register_dashboard_apis
 from .backend.models import (
+    IMAGE_EXTENSIONS,
+    InvalidCategoryError,
     clear_all_emojis,
     clear_category_emojis,
     get_emoji_by_category,
@@ -45,16 +43,26 @@ from .image_host.img_sync import ImageSync
 from .init import init_plugin
 from .utils import (
     dict_to_string,
-    generate_secret_key,
     get_default_meme_categories,
     load_json,
     restore_default_memes,
 )
-from .webui import ServerState, run_server
 
 
 class ConfirmationCancelled(Exception):
     """Raised when a dangerous command is cancelled by the user."""
+
+
+def list_category_meme_files(category_path: str) -> list[str]:
+    """列出一个分类目录下受支持的图片文件（统一格式规则，后缀比较忽略大小写）。"""
+    try:
+        return [
+            f
+            for f in os.listdir(category_path)
+            if f.lower().endswith(IMAGE_EXTENSIONS)
+        ]
+    except OSError:
+        return []
 
 
 class SenderScopedSessionFilter(SessionFilter):
@@ -66,7 +74,7 @@ class SenderScopedSessionFilter(SessionFilter):
 
 
 @register(
-    "meme_manager", "anka", "anka - 表情包管理器 - 支持表情包发送及表情包上传", "3.20"
+    "meme_manager", "anka", "表情包管理器 - 自动发送与内置面板图库管理", "3.21"
 )
 class MemeSender(Star):
     def __init__(self, context: Context, config: dict = None):
@@ -123,11 +131,18 @@ class MemeSender(Star):
                 # 延迟日志记录，避免 logger 未初始化
                 self._r2_bucket_name = r2_config.get("bucket_name")
 
-        # 用于管理服务器
-        self.webui_process = None
+        # 图库/分类写操作互斥锁（Dashboard API 与聊天命令共用）
+        self._library_lock = asyncio.Lock()
 
-        self.server_key = None
-        self.server_port = self.config.get("webui_port", 5000)
+        # 图床同步统一入口状态：短锁登记 + 后台任务 + 只读轮询
+        self._sync_lock = asyncio.Lock()
+        self._sync_task: asyncio.Task | None = None
+        self._sync_start_task: asyncio.Task | None = None
+        self._sync_info: dict = {}
+        self._sync_last_result: dict | None = None
+
+        # 注册 Dashboard 插件页 API（无独立端口与二次登录）
+        register_dashboard_apis(self)
 
         # 初始化表情状态
         self.found_emotions = []  # 存储找到的表情
@@ -204,180 +219,21 @@ class MemeSender(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @meme_manager.command("开启管理后台")
     async def start_webui(self, event: AstrMessageEvent):
-        """启动表情包管理服务器"""
-        if event.get_message_type() != PlatformMessageType.FRIEND_MESSAGE:
-            yield event.plain_result(
-                "⚠️ 该指令仅限私聊使用。\n请私聊发送“表情管理 开启管理后台”。"
-            )
-            return
-
-        try:
-            self.server_port = self.config.get("webui_port", 5000)
-            is_running = bool(self.webui_process and self.webui_process.is_alive())
-            if is_running and self.server_key and await self._check_port_active():
-                yield event.plain_result(
-                    "ℹ️ 管理后台已在运行，以下是当前访问信息：\n\n"
-                    + self._build_webui_access_message()
-                )
-                return
-
-            state = ServerState()
-            state.ready.clear()
-
-            # 生成秘钥
-            self.server_key = generate_secret_key(8)
-
-            # 检查端口占用情况
-            if await self._check_port_active():
-                await self._shutdown()
-                await asyncio.sleep(1)  # 等待系统释放端口
-                if await self._check_port_active():
-                    raise RuntimeError(f"端口 {self.server_port} 仍被占用")
-
-            config_for_server = {
-                "img_sync": self.img_sync,
-                "category_manager": self.category_manager,
-                "webui_port": self.server_port,
-                "server_key": self.server_key,
-            }
-            self.webui_process = Process(target=run_server, args=(config_for_server,))
-            self.webui_process.start()
-
-            # 等待服务器就绪（轮询检测端口激活）
-            for i in range(10):
-                if await self._check_port_active():
-                    break
-                await asyncio.sleep(1)
-            else:
-                raise RuntimeError("⌛ 启动超时，请检查防火墙设置")
-
-            access_message = self._build_webui_access_message()
-            yield event.plain_result(access_message)
-
-        except Exception as e:
-            logger.error(f"启动失败: {str(e)}")
-            yield event.plain_result(
-                f"⚠️ 后台启动失败，请稍后重试\n（错误代码：{str(e)}）"
-            )
-            await self._cleanup_resources()
-
-    async def _check_port_active(self):
-        """验证端口是否实际已激活"""
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection("127.0.0.1", self.server_port), timeout=1
-            )
-            writer.close()
-            return True
-        except Exception:
-            return False
-
-    def _build_webui_access_urls(self) -> list[str]:
-        """参考 AstrBot 本体生成可访问地址列表。"""
-        access_urls = [f"http://localhost:{self.server_port}"]
-        seen_hosts = {"localhost", "127.0.0.1"}
-
-        try:
-            for ip_addr in get_local_ip_addresses():
-                if not ip_addr or ip_addr in seen_hosts or ip_addr.startswith("127."):
-                    continue
-                seen_hosts.add(ip_addr)
-                access_urls.append(f"http://{ip_addr}:{self.server_port}")
-        except Exception as exc:
-            logger.warning(f"获取本地网络地址失败: {exc}")
-
-        return access_urls
-
-    def _build_webui_access_message(self) -> str:
-        access_urls = self._build_webui_access_urls()
-        parts = [
-            "✨ 管理后台已就绪！",
-            "━━━━━━━━━━━━━━",
-            "表情包管理服务器已启动！",
-            "🔗 可访问地址：",
-            f"   ➜ 本地: {access_urls[0]}",
-        ]
-
-        for url in access_urls[1:]:
-            parts.append(f"   ➜ 网络: {url}")
-
-        parts.extend(
-            [
-                f"🔑 临时密钥：{self.server_key} （本次有效）",
-                "⚠️ 请勿分享给未授权用户",
-            ]
+        """管理后台已迁移到 AstrBot 内置面板"""
+        yield event.plain_result(
+            "ℹ️ 管理后台已经搬进 AstrBot 面板啦！\n"
+            "━━━━━━━━━━━━━━\n"
+            "打开 AstrBot Dashboard → 插件页面 → meme_manager → 「表情包管理」即可管理图库。\n"
+            "不再需要单独开启端口和临时密钥。"
         )
-
-        if len(access_urls) == 1:
-            parts.append(
-                "⚠️ 当前仅检测到本地地址，如需远程访问，请确认端口映射、防火墙和宿主机网络已放行。"
-            )
-
-        callback_api_base = str(
-            astrbot_config.get("callback_api_base", "") or ""
-        ).strip()
-        if callback_api_base:
-            parts.append(
-                f"ℹ️ 如你通过反代对外暴露服务，请优先使用你自己的外部地址访问。当前 callback_api_base: {callback_api_base}"
-            )
-
-        return "\n".join(parts)
-
-    async def _send_webui_access_info_privately(
-        self, event: AstrMessageEvent, message: str
-    ) -> bool:
-        """只向当前操作者私聊发送管理后台地址。"""
-        sender_id = str(event.get_sender_id() or "").strip()
-        if not sender_id:
-            return False
-
-        private_session = MessageSession(
-            event.get_platform_id(),
-            PlatformMessageType.FRIEND_MESSAGE,
-            sender_id,
-        )
-
-        try:
-            return await self.context.send_message(
-                private_session, MessageChain([Plain(message)])
-            )
-        except Exception as exc:
-            logger.warning(f"私聊发送管理后台地址失败: {exc}")
-            return False
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @meme_manager.command("关闭管理后台")
     async def stop_server(self, event: AstrMessageEvent):
-        """关闭表情包管理服务器的指令"""
-        try:
-            is_running = bool(self.webui_process and self.webui_process.is_alive())
-            if not is_running:
-                yield event.plain_result("ℹ️ 管理后台当前未运行。")
-                return
-
-            await self._shutdown()
-            yield event.plain_result("✅ 管理后台已关闭。")
-        except Exception as e:
-            yield event.plain_result(f"❌ 管理后台关闭失败：{str(e)}")
-        finally:
-            await self._cleanup_resources()
-
-    async def _shutdown(self):
-        if self.webui_process:
-            self.webui_process.terminate()
-            self.webui_process.join()
-
-    async def _cleanup_resources(self):
-        if self.img_sync:
-            self.img_sync.stop_sync()
-        self.server_key = None
-        self.server_port = None
-        if self.webui_process:
-            if self.webui_process.is_alive():
-                self.webui_process.terminate()
-                self.webui_process.join()
-        self.webui_process = None
-        logger.info("资源清理完成")
+        """管理后台已迁移到 AstrBot 内置面板，无需关闭"""
+        yield event.plain_result(
+            "ℹ️ 管理后台已整合进 AstrBot 面板，不再运行独立服务，无需关闭。"
+        )
 
     def _get_manageable_categories(self) -> set[str]:
         """Return the union of configured and local categories."""
@@ -542,20 +398,24 @@ class MemeSender(Star):
             )
             return
 
-        restore_result = restore_default_memes(normalized_category)
-        if not restore_result["source_exists"]:
-            yield event.plain_result("❌ 未找到插件内置默认表情包资源。")
-            return
+        async with self._library_lock:
+            if overwrite_sync_running(self):
+                yield event.plain_result("⚠️ 图床覆盖同步进行中，请完成后再恢复表情包。")
+                return
+            restore_result = restore_default_memes(normalized_category)
+            if not restore_result["source_exists"]:
+                yield event.plain_result("❌ 未找到插件内置默认表情包资源。")
+                return
 
-        copied_files = restore_result["copied_files"]
-        duplicate_files = restore_result["duplicate_files"]
-        renamed_files = restore_result["renamed_files"]
-        restored_categories = sorted(
-            set(copied_files) | set(duplicate_files) | set(renamed_files)
-        )
+            copied_files = restore_result["copied_files"]
+            duplicate_files = restore_result["duplicate_files"]
+            renamed_files = restore_result["renamed_files"]
+            restored_categories = sorted(
+                set(copied_files) | set(duplicate_files) | set(renamed_files)
+            )
 
-        if restored_categories:
-            self._ensure_default_category_descriptions(restored_categories)
+            if restored_categories:
+                self._ensure_default_category_descriptions(restored_categories)
 
         copied_count = sum(len(files) for files in copied_files.values())
         duplicate_count = sum(len(files) for files in duplicate_files.values())
@@ -621,7 +481,16 @@ class MemeSender(Star):
         if not await self._wait_for_command_confirmation(event):
             return
 
-        result = clear_category_emojis(category)
+        result = None
+        async with self._library_lock:
+            if overwrite_sync_running(self):
+                yield event.plain_result("⚠️ 图床覆盖同步进行中，请完成后再清空图库。")
+                return
+            try:
+                result = clear_category_emojis(category)
+            except InvalidCategoryError as e:
+                yield event.plain_result(f"⚠️ 类型「{category}」非法：{e}")
+                return
         deleted_count = len(result["deleted_files"])
         yield event.plain_result(
             f"✅ 已清空类型「{category}」，共删除 {deleted_count} 个表情包。"
@@ -653,7 +522,15 @@ class MemeSender(Star):
         if not await self._wait_for_command_confirmation(event):
             return
 
-        result = clear_all_emojis()
+        async with self._library_lock:
+            if overwrite_sync_running(self):
+                yield event.plain_result("⚠️ 图床覆盖同步进行中，请完成后再清空图库。")
+                return
+            try:
+                result = clear_all_emojis()
+            except InvalidCategoryError as e:
+                yield event.plain_result(f"⚠️ 清空失败：{e}")
+                return
         deleted_total = sum(result["deleted_by_category"].values())
         yield event.plain_result(
             f"✅ 已清空全部表情包，共删除 {deleted_total} 个文件，类型配置已保留。"
@@ -689,7 +566,12 @@ class MemeSender(Star):
         if not await self._wait_for_command_confirmation(event):
             return
 
-        if not self.category_manager.delete_category(category):
+        async with self._library_lock:
+            if overwrite_sync_running(self):
+                yield event.plain_result("⚠️ 图床覆盖同步进行中，请完成后再删除分类。")
+                return
+            deleted = self.category_manager.delete_category(category)
+        if not deleted:
             yield event.plain_result(f"❌ 删除类型「{category}」失败，请稍后重试。")
             return
 
@@ -720,17 +602,14 @@ class MemeSender(Star):
         save_dir = os.path.join(MEMES_DIR, category)
 
         try:
-            os.makedirs(save_dir, exist_ok=True)
-            saved_files = []
-
             # 创建忽略 SSL 验证的上下文
             ssl_context = ssl.create_default_context()
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
 
+            # 第一阶段：网络下载在锁外进行，慢链接不会阻塞网页的图库操作
+            downloaded = []  # [(idx, content)]
             for idx, img in enumerate(images, 1):
-                timestamp = int(time.time())
-
                 try:
                     # 特殊处理腾讯多媒体域名
                     if "multimedia.nt.qq.com.cn" in img.url:
@@ -747,7 +626,23 @@ class MemeSender(Star):
                         ) as session:
                             async with session.get(img.url) as resp:
                                 content = await resp.read()
+                    downloaded.append((idx, content))
+                except Exception as e:
+                    logger.error(f"下载图片失败: {str(e)}")
+                    yield event.plain_result(f"文件 {img.url} 下载失败啦: {str(e)}")
+                    continue
 
+            # 第二阶段：写盘与格式识别在锁内完成
+            saved_files = []
+            timestamp = int(time.time())
+            async with self._library_lock:
+                if overwrite_sync_running(self):
+                    yield event.plain_result(
+                        "⚠️ 图床覆盖同步进行中，本次图片未保存，请完成后重新发送。"
+                    )
+                    return
+                os.makedirs(save_dir, exist_ok=True)
+                for idx, content in downloaded:
                     try:
                         with PILImage.open(io.BytesIO(content)) as img:
                             file_type = img.format.lower()
@@ -769,11 +664,6 @@ class MemeSender(Star):
                         f.write(content)
                     saved_files.append(filename)
 
-                except Exception as e:
-                    logger.error(f"下载图片失败: {str(e)}")
-                    yield event.plain_result(f"文件 {img.url} 下载失败啦: {str(e)}")
-                    continue
-
             del self.upload_states[user_key]
 
             # 基础成功消息
@@ -791,19 +681,144 @@ class MemeSender(Star):
                 )
 
             yield event.chain_result(result_msg)
-            await self.reload_emotions()
+            try:
+                await self.reload_emotions()
+            except Exception:
+                yield event.plain_result(
+                    "⚠️ 图片已保存，但运行时刷新失败，建议重载插件或重启 AstrBot。"
+                )
 
         except Exception as e:
             yield event.plain_result(f"保存失败了：{str(e)}")
 
     async def reload_emotions(self):
-        """动态重新加载表情配置"""
+        """动态重新加载表情配置。失败时记日志并抛出异常，由调用方决定如何反馈。"""
         try:
-            self.category_manager.sync_with_filesystem()
+            if not self.category_manager.sync_with_filesystem():
+                raise RuntimeError("分类配置与文件系统同步失败")
             # 重新加载表情配置后，需要重新构建提示词
             self._reload_personas()
         except Exception as e:
             logger.error(f"重新加载表情配置失败: {str(e)}")
+            raise
+
+    async def _start_image_sync(self, direction: str) -> tuple[bool, str]:
+        """图床同步统一入口：短锁登记 + 后台执行 + 立即返回。
+
+        锁只用于"检查空闲并登记"这一瞬间；已有任务在跑时直接拒绝，
+        绝不静默停止旧任务（旧 start_sync 的行为）。
+        """
+        if not self.img_sync:
+            return False, "图床服务未配置"
+
+        async with self._sync_lock:
+            if direction in ("overwrite_to_remote", "overwrite_from_remote"):
+                async with self._library_lock:
+                    return self._register_sync_task(direction)
+            return self._register_sync_task(direction)
+
+    def _register_sync_task(self, direction: str) -> tuple[bool, str]:
+        """在同步锁内登记任务；覆盖任务还需持有图库写锁。"""
+        busy = bool(
+            (self._sync_task and not self._sync_task.done())
+            or (
+                self.img_sync.sync_process
+                and self.img_sync.sync_process.is_alive()
+            )
+        )
+        if busy:
+            return False, "已有同步任务进行中，请等待完成后再试"
+        self._sync_info = {"direction": direction, "started_at": time.time()}
+        self._sync_last_result = None
+        self._sync_task = asyncio.create_task(self._run_image_sync(direction))
+        return True, "已启动"
+
+    @staticmethod
+    def _stop_abandoned_sync_process(start_task: asyncio.Task) -> None:
+        """取消启动等待后，回收随后才启动成功的子进程。"""
+        try:
+            process = start_task.result()
+        except Exception as exc:
+            logger.error("图床同步进程启动失败: %s", exc)
+            return
+
+        if process.is_alive():
+            process.terminate()
+            # terminate 由启动结果回调触发；不要阻塞主事件循环等待子进程。
+
+    async def _run_image_sync(self, direction: str) -> None:
+        """后台执行同步任务；完成后统一收尾（下载类刷新分类/提示词/缓存）。
+
+        与网页是否打开无关，插件主进程持有任务直到结束。
+        """
+        success = False
+        message = ""
+        process_started = False
+        try:
+            # check_status 会扫盘并可能访问远端，放线程避免阻塞事件循环
+            status = await asyncio.to_thread(self.img_sync.check_status)
+            need_work = True
+            if direction == "upload" and not status.get("to_upload"):
+                need_work = False
+            elif direction == "download" and not status.get("to_download"):
+                need_work = False
+            elif direction == "overwrite_to_remote" and not (
+                status.get("to_upload") or status.get("to_delete_remote")
+            ):
+                need_work = False
+            elif direction == "overwrite_from_remote" and not (
+                status.get("to_download") or status.get("to_delete_local")
+            ):
+                need_work = False
+
+            if not need_work:
+                success = True
+                message = "没有需要同步的文件"
+            else:
+                # 绕过 start_sync()（它会先停掉正在运行的任务），直接起子进程
+                start_task = asyncio.create_task(
+                    asyncio.to_thread(self.img_sync._start_sync_process, direction)
+                )
+                self._sync_start_task = start_task
+                try:
+                    process = await asyncio.shield(start_task)
+                except asyncio.CancelledError:
+                    start_task.add_done_callback(self._stop_abandoned_sync_process)
+                    raise
+                except Exception:
+                    self._sync_start_task = None
+                    raise
+                # 真实 _start_sync_process 只返回进程不登记，这里登记到
+                # img_sync.sync_process，便于忙碌判断和 terminate 时停止
+                self.img_sync.sync_process = process
+                self._sync_start_task = None
+                process_started = True
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, process.join)
+                success = process.exitcode == 0
+                message = "同步完成" if success else f"同步进程退出码: {process.exitcode}"
+        except asyncio.CancelledError:
+            message = "同步任务已取消"
+            raise
+        except Exception as e:
+            logger.error(f"图床同步任务异常: {e}", exc_info=True)
+            message = f"同步任务异常: {e}"
+        finally:
+            self._sync_last_result = {
+                "direction": direction,
+                "success": success,
+                "message": message,
+            }
+            # 下载类完成后刷新运行时，无论网页是否还开着
+            if process_started and direction in ("download", "overwrite_from_remote"):
+                try:
+                    if not self.category_manager.sync_with_filesystem():
+                        raise RuntimeError("分类配置与文件系统同步返回失败")
+                    await self.reload_emotions()
+                except Exception as e:
+                    logger.error(f"同步完成后刷新运行时失败: {e}")
+                    self._sync_last_result["success"] = False
+                    self._sync_last_result["message"] += "；但本地刷新失败，请重载插件"
 
     def _is_position_in_thinking_tags(self, text: str, position: int) -> bool:
         """检查指定位置是否在thinking标签内
@@ -840,11 +855,7 @@ class MemeSender(Star):
                 )
                 continue
 
-            memes = [
-                f
-                for f in os.listdir(emotion_path)
-                if f.endswith((".jpg", ".png", ".gif"))
-            ]
+            memes = list_category_meme_files(emotion_path)
             if not memes:
                 logger.error(f"表情分类 {emotion} 对应的目录为空: {emotion_path}")
             else:
@@ -1279,6 +1290,10 @@ class MemeSender(Star):
                 if img.format == "GIF":
                     return image_path
 
+                # 多帧动图（动画 WEBP/PNG 等）保留原文件，不压成第一帧
+                if getattr(img, "is_animated", False):
+                    return image_path
+
                 # 创建临时文件
                 temp_dir = tempfile.gettempdir()
                 temp_filename = os.path.join(
@@ -1332,11 +1347,7 @@ class MemeSender(Star):
                 if not os.path.exists(emotion_path):
                     continue
 
-                memes = [
-                    f
-                    for f in os.listdir(emotion_path)
-                    if f.endswith((".jpg", ".png", ".gif"))
-                ]
+                memes = list_category_meme_files(emotion_path)
                 if not memes:
                     continue
 
@@ -1484,11 +1495,7 @@ class MemeSender(Star):
                             if not path_exists:
                                 continue
 
-                            memes = [
-                                f
-                                for f in os.listdir(emotion_path)
-                                if f.endswith((".jpg", ".png", ".gif"))
-                            ]
+                            memes = list_category_meme_files(emotion_path)
 
                             if not memes:
                                 continue
@@ -1746,13 +1753,7 @@ class MemeSender(Star):
                         for category in os.listdir(MEMES_DIR):
                             category_path = os.path.join(MEMES_DIR, category)
                             if os.path.isdir(category_path):
-                                files = [
-                                    f
-                                    for f in os.listdir(category_path)
-                                    if f.endswith(
-                                        (".jpg", ".jpeg", ".png", ".gif", ".webp")
-                                    )
-                                ]
+                                files = list_category_meme_files(category_path)
                                 count = len(files)
                                 local_stats[category] = count
                                 local_total += count
@@ -1808,12 +1809,19 @@ class MemeSender(Star):
             return
 
         try:
-            yield event.plain_result("⚡ 正在开启云端同步任务...")
-            success = await self.img_sync.start_sync("upload")
-            if success:
-                yield event.plain_result("云端同步已完成！")
+            ok, message = await self._start_image_sync("upload")
+            if not ok:
+                yield event.plain_result(f"⚠️ {message}")
+                return
+            yield event.plain_result("⚡ 云端同步任务已启动，完成后可用「同步状态」查看结果。")
+            await self._sync_task  # 聊天命令保持等待完成后汇报
+            last = self._sync_last_result or {}
+            if last.get("success"):
+                yield event.plain_result(f"云端同步已完成！{last.get('message', '')}")
             else:
-                yield event.plain_result("云端同步失败，请查看日志哦。")
+                yield event.plain_result(
+                    f"云端同步失败：{last.get('message', '请查看日志')}"
+                )
         except Exception as e:
             logger.error(f"同步到云端失败: {str(e)}")
             yield event.plain_result(f"同步到云端失败: {str(e)}")
@@ -1832,11 +1840,7 @@ class MemeSender(Star):
                 for category in os.listdir(MEMES_DIR):
                     category_path = os.path.join(MEMES_DIR, category)
                     if os.path.isdir(category_path):
-                        files = [
-                            f
-                            for f in os.listdir(category_path)
-                            if f.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp"))
-                        ]
+                        files = list_category_meme_files(category_path)
                         count = len(files)
                         local_stats[category] = count
                         local_total += count
@@ -1948,14 +1952,19 @@ class MemeSender(Star):
             return
 
         try:
-            yield event.plain_result("开始从云端进行同步...")
-            success = await self.img_sync.start_sync("download")
-            if success:
-                yield event.plain_result("从云端同步已完成！")
-                # 重新加载表情配置
-                await self.reload_emotions()
+            ok, message = await self._start_image_sync("download")
+            if not ok:
+                yield event.plain_result(f"⚠️ {message}")
+                return
+            yield event.plain_result("⚡ 从云端同步任务已启动，完成后可用「同步状态」查看结果。")
+            await self._sync_task  # 聊天命令保持等待完成后汇报
+            last = self._sync_last_result or {}
+            if last.get("success"):
+                yield event.plain_result(f"从云端同步已完成！{last.get('message', '')}")
             else:
-                yield event.plain_result("从云端同步失败，请查看日志哦。")
+                yield event.plain_result(
+                    f"从云端同步失败：{last.get('message', '请查看日志')}"
+                )
         except Exception as e:
             logger.error(f"从云端同步失败: {str(e)}")
             yield event.plain_result(f"从云端同步失败: {str(e)}")
@@ -1974,13 +1983,20 @@ class MemeSender(Star):
             yield event.plain_result(
                 "⚠️ 正在执行覆盖到云端任务（将清理云端多余文件）..."
             )
-            success = await self.img_sync.start_sync("overwrite_to_remote")
-            if success:
+            ok, message = await self._start_image_sync("overwrite_to_remote")
+            if not ok:
+                yield event.plain_result(f"⚠️ {message}")
+                return
+            await self._sync_task
+            last = self._sync_last_result or {}
+            if last.get("success"):
                 yield event.plain_result(
                     "覆盖到云端任务已完成！云端现在与本地完全一致。"
                 )
             else:
-                yield event.plain_result("任务失败，请查看日志。")
+                yield event.plain_result(
+                    f"任务失败：{last.get('message', '请查看日志')}"
+                )
         except Exception as e:
             logger.error(f"覆盖到云端失败: {str(e)}")
             yield event.plain_result(f"覆盖到云端失败: {str(e)}")
@@ -1999,30 +2015,54 @@ class MemeSender(Star):
             yield event.plain_result(
                 "⚠️ 正在执行从云端覆盖任务（将清理本地多余文件）..."
             )
-            success = await self.img_sync.start_sync("overwrite_from_remote")
-            if success:
+            ok, message = await self._start_image_sync("overwrite_from_remote")
+            if not ok:
+                yield event.plain_result(f"⚠️ {message}")
+                return
+            await self._sync_task
+            last = self._sync_last_result or {}
+            if last.get("success"):
                 yield event.plain_result(
                     "从云端覆盖任务已完成！本地现在与云端完全一致。"
                 )
             else:
-                yield event.plain_result("任务失败，请查看日志。")
+                yield event.plain_result(
+                    f"任务失败：{last.get('message', '请查看日志')}"
+                )
         except Exception as e:
             logger.error(f"从云端覆盖失败: {str(e)}")
             yield event.plain_result(f"从云端覆盖失败: {str(e)}")
 
     async def terminate(self):
         """清理资源"""
-        # 恢复人格
+        # 取消进行中的图床同步后台任务：先停子进程让 join 返回，再取消并等待收尾
+        if self.img_sync:
+            self.img_sync.stop_sync()
+        if self._sync_task and not self._sync_task.done():
+            self._sync_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(self._sync_task), timeout=5)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+        start_task = self._sync_start_task
+        if start_task:
+            try:
+                process = await asyncio.wait_for(asyncio.shield(start_task), timeout=5)
+                if process is not self.img_sync.sync_process:
+                    if process.is_alive():
+                        process.terminate()
+                    await asyncio.to_thread(process.join, 5)
+                    if process.is_alive():
+                        process.kill()
+                        await asyncio.to_thread(process.join, 1)
+            except asyncio.TimeoutError:
+                logger.warning("图床进程仍在启动，完成时将自动终止")
+            except Exception as exc:
+                logger.error("收尾图床同步进程失败: %s", exc)
+        # 下载任务取消后的刷新可能重建提示词，恢复人格必须放在收尾之后。
         personas = self.context.provider_manager.personas
         for persona, persona_backup in zip(personas, self.persona_backup):
             persona["prompt"] = persona_backup["prompt"]
-
-        # 停止图床同步
-        if self.img_sync:
-            self.img_sync.stop_sync()
-
-        await self._shutdown()
-        await self._cleanup_resources()
 
     def _merge_components_with_images(self, components, images):
         """将表情图片与文本组件智能配对，支持分段回复
